@@ -3,63 +3,171 @@
 # Grum Gebreyesus Teklewold
 # Center for Quantitative Genetics and Genomics
 # ============================================================
-
-import os
+import os, json, cv2, joblib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import joblib
 
+from scipy.ndimage import distance_transform_edt
 from skimage.morphology import skeletonize
 from skimage.measure import regionprops
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import (
-    mean_squared_error, r2_score,
-    classification_report, confusion_matrix,
-    roc_auc_score, roc_curve
-)
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.metrics import mean_squared_error, r2_score, classification_report, confusion_matrix, roc_auc_score, roc_curve
 from sklearn.preprocessing import LabelBinarizer
 
 # ============================================================
-# 1. Data paths
+# 1. Paths and constants
 # ============================================================
 
-DATA_ROOT = "/data/pigtail"
+BASE = "/data/pigtail"
+COCO1 = os.path.join(BASE, "Raw_72_Train.json")
+COCO2 = os.path.join(BASE, "Corrected_Val_Pre_Annotations_Raw_New.json")
+GT_PATH = os.path.join(BASE, "taillength_ground_truth_Raw_Clean.txt")
+OUTPUT = os.path.join(BASE, "outputs")
+os.makedirs(OUTPUT, exist_ok=True)
 
-FEATURE_FILE = os.path.join(DATA_ROOT, "image_features.csv")
-GROUND_TRUTH_FILE = os.path.join(DATA_ROOT, "taillength_ground_truth_Raw_Clean.txt")
-
-OUTPUT_DIR = os.path.join(DATA_ROOT, "outputs")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+RULER_WIDTH_CM = 5.4
+RULER_HEIGHT_CM = 8.57
 
 # ============================================================
-# 2. Load merged feature table
+# 2. COCO helpers
 # ============================================================
 
-df_feat = pd.read_csv(FEATURE_FILE)
-gt = pd.read_csv(GROUND_TRUTH_FILE, sep=r"\s+", engine="python")
+def coco_seg_to_polygons(seg):
+    if isinstance(seg, list):
+        return seg
+    return []
 
-gt["TagID"] = gt["TagID"].astype(str).str.replace(".0", "")
+def polygons_to_mask(polygons, w, h):
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for poly in polygons:
+        pts = np.array(poly).reshape(-1,2).astype(np.int32)
+        cv2.fillPoly(mask, [pts], 255)
+    return mask
+
+# ============================================================
+# 3. Tail geometry
+# ============================================================
+
+def compute_tail_length_px(mask):
+    skel = skeletonize(mask > 0)
+    return float(skel.sum())
+
+def compute_tail_thickness_px(mask):
+    dist = distance_transform_edt(mask > 0)
+    vals = dist[dist > 0]
+    return 2*vals.mean(), 2*vals.max()
+
+def compute_advanced_features(mask):
+    props = regionprops(mask.astype(int))[0]
+    area = props.area
+    perim = props.perimeter
+    bbox_w = props.bbox[3] - props.bbox[1]
+    bbox_h = props.bbox[2] - props.bbox[0]
+    convex = props.convex_area
+
+    return {
+        "area_px": area,
+        "perimeter_px": perim,
+        "bbox_w_px": bbox_w,
+        "bbox_h_px": bbox_h,
+        "convex_area_px": convex,
+        "solidity": area/convex if convex>0 else np.nan,
+        "extent": area/(bbox_w*bbox_h) if bbox_w*bbox_h>0 else np.nan,
+        "eccentricity": props.eccentricity,
+        "compactness": perim**2/(4*np.pi*area) if area>0 else np.nan,
+        "circularity": 4*np.pi*area/(perim**2) if perim>0 else np.nan,
+    }
+
+# ============================================================
+# 4. Ruler calibration
+# ============================================================
+
+def cm_per_pixel_from_ruler_mask(ruler_mask):
+    cnts,_ = cv2.findContours(ruler_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(cnts)==0:
+        return None
+    c = max(cnts, key=cv2.contourArea)
+    x,y,w,h = cv2.boundingRect(c)
+    return ((RULER_WIDTH_CM/w)+(RULER_HEIGHT_CM/h))/2
+
+# ============================================================
+# 5. Load COCO annotations
+# ============================================================
+
+with open(COCO1) as f: coco1=json.load(f)
+with open(COCO2) as f: coco2=json.load(f)
+
+images = coco1["images"] + coco2["images"]
+annotations = coco1["annotations"] + coco2["annotations"]
+
+# ============================================================
+# 6. Feature extraction
+# ============================================================
+
+rows = []
+
+for img in images:
+    w,h = img["width"], img["height"]
+    fname = img["file_name"]
+    anns = [a for a in annotations if a["image_id"]==img["id"]]
+
+    tail_polys = [p for a in anns if a["category_id"]==1 for p in coco_seg_to_polygons(a["segmentation"])]
+    ruler_polys = [p for a in anns if a["category_id"]==2 for p in coco_seg_to_polygons(a["segmentation"])]
+
+    if not tail_polys or not ruler_polys:
+        continue
+
+    tail_mask = polygons_to_mask(tail_polys,w,h)
+    ruler_mask = polygons_to_mask(ruler_polys,w,h)
+
+    cm_px = cm_per_pixel_from_ruler_mask(ruler_mask)
+    if cm_px is None:
+        continue
+
+    Lpx = compute_tail_length_px(tail_mask)
+    Tmean,Tmax = compute_tail_thickness_px(tail_mask)
+    feats = compute_advanced_features(tail_mask)
+
+    rows.append({
+        "Filename": fname,
+        "TagID": os.path.splitext(fname)[0],
+        "TailLength_cm_skeleton": Lpx * cm_px,
+        "TailThickness_cm_mean": Tmean * cm_px,
+        "TailThickness_cm_max": Tmax * cm_px,
+        "TailArea_cm2": feats["area_px"] * cm_px**2,
+        "TailPerimeter_cm": feats["perimeter_px"] * cm_px,
+        "TailBBoxWidth_cm": feats["bbox_w_px"] * cm_px,
+        "TailBBoxHeight_cm": feats["bbox_h_px"] * cm_px,
+        "TailConvexArea_cm2": feats["convex_area_px"] * cm_px**2,
+        "TailSolidity": feats["solidity"],
+        "TailExtent": feats["extent"],
+        "TailEccentricity": feats["eccentricity"],
+        "TailCompactness": feats["compactness"],
+        "TailCircularity": feats["circularity"]
+    })
+
+df_feat = pd.DataFrame(rows)
+print("Extracted tails:", len(df_feat))
+
+# ============================================================
+# 7. Merge with ground truth
+# ============================================================
+
+gt = pd.read_csv(GT_PATH, sep=r"\s+", engine="python")
+gt["TagID"] = gt["TagID"].astype(str).str.replace(".0","")
+
 df_feat["TagID"] = df_feat["TagID"].astype(str)
-
-df_feat = df_feat.merge(gt[["TagID", "TailLength_cm", "TailThickness_cm", "TailDocking", "HerdId"]],
-                        on="TagID", how="left")
-
-df_feat.rename(columns={
-    "TailLength_cm": "TailLength_cm_gt",
-    "TailThickness_cm": "TailThickness_cm_gt"
-}, inplace=True)
-
+df_feat = df_feat.merge(gt, on="TagID", how="inner")
 print("Merged rows:", len(df_feat))
 
 # ============================================================
-# 3. Feature engineering
+# 8. Feature engineering
 # ============================================================
 
 eps = 1e-6
-
 L = df_feat["TailLength_cm_skeleton"]
 Tmean = df_feat["TailThickness_cm_mean"]
 Tmax = df_feat["TailThickness_cm_max"]
@@ -77,14 +185,14 @@ df_feat["ThicknessRatio_max_vs_perimeter"] = Tmax / (P + eps)
 df_feat["TaperIndex"] = Tmax / (Tmean + eps)
 
 # ============================================================
-# 4. Tail length regression (Random Forest)
+# 9. Tail length regression
 # ============================================================
 
 reg_features = [
     "TailLength_cm_skeleton","TailThickness_cm_mean","TailThickness_cm_max",
     "TailArea_cm2","TailPerimeter_cm","TailBBoxWidth_cm","TailBBoxHeight_cm",
-    "TailAspectRatio","TailConvexArea_cm2","TailSolidity","TailExtent",
-    "TailEccentricity","TailTortuosity","TailCompactness","TailCircularity",
+    "TailConvexArea_cm2","TailSolidity","TailExtent","TailEccentricity",
+    "TailCompactness","TailCircularity",
     "ThicknessRatio_mean_vs_len","ThicknessRatio_mean_vs_sqrtArea",
     "ThicknessRatio_mean_vs_perimeter",
     "ThicknessRatio_max_vs_len","ThicknessRatio_max_vs_sqrtArea",
@@ -92,113 +200,65 @@ reg_features = [
 ]
 
 df_reg = df_feat.dropna(subset=reg_features + ["TailLength_cm_gt"])
-X = df_reg[reg_features]
-y = df_reg["TailLength_cm_gt"]
+X = df_reg[reg_features].values
+y = df_reg["TailLength_cm_gt"].values
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+Xtr, Xte, ytr, yte = train_test_split(X,y,test_size=0.2,random_state=42)
 
-rf_len = RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1)
-rf_len.fit(X_train, y_train)
+rf_len = RandomForestRegressor(n_estimators=300,random_state=42,n_jobs=-1)
+rf_len.fit(Xtr,ytr)
 
-y_pred_test = rf_len.predict(X_test)
+df_feat["PredTailLength_cm"] = rf_len.predict(df_feat[reg_features].fillna(0).values)
 
-print("Length R²:", r2_score(y_test, y_pred_test))
-print("Length RMSE:", np.sqrt(mean_squared_error(y_test, y_pred_test)))
-
-df_feat["PredTailLength_cm"] = rf_len.predict(df_feat[reg_features].fillna(0))
+print("Test R2:", r2_score(yte, rf_len.predict(Xte)))
+print("Test RMSE:", np.sqrt(mean_squared_error(yte, rf_len.predict(Xte))))
 
 # ============================================================
-# 5. Docking classification (RF)
+# 10. Docking classification
 # ============================================================
 
 clf_features = reg_features
+df_clf = df_feat.dropna(subset=clf_features+["TailDocking"])
 
-df_clf = df_feat.dropna(subset=clf_features + ["TailDocking"])
-Xc = df_clf[clf_features]
-yc = df_clf["TailDocking"]
+Xc = df_clf[clf_features].values
+yc = df_clf["TailDocking"].values
 
-Xc_train, Xc_test, yc_train, yc_test = train_test_split(
-    Xc, yc, test_size=0.2, random_state=42, stratify=yc
-)
+Xtr,Xte,ytr,yte = train_test_split(Xc,yc,test_size=0.2,random_state=42,stratify=yc)
 
-rf_clf = RandomForestClassifier(n_estimators=400, random_state=42, n_jobs=-1, class_weight="balanced")
-rf_clf.fit(Xc_train, yc_train)
+rf_clf = RandomForestClassifier(n_estimators=400,random_state=42,n_jobs=-1,class_weight="balanced")
+rf_clf.fit(Xtr,ytr)
+yp = rf_clf.predict(Xte)
 
-yc_pred = rf_clf.predict(Xc_test)
+print(classification_report(yte,yp))
+cm = confusion_matrix(yte,yp,labels=["Intact","Half","Quarter"])
 
-print(classification_report(yc_test, yc_pred))
-
-cm = confusion_matrix(yc_test, yc_pred, labels=["Intact","Half","Quarter"])
-
-plt.figure(figsize=(7,6))
-sns.heatmap(cm, annot=True, fmt="d",
-            xticklabels=["Intact","Half","Quarter"],
-            yticklabels=["Intact","Half","Quarter"],
-            cmap="Blues")
-plt.xlabel("Predicted")
-plt.ylabel("Observed")
-plt.title("Docking classification")
-plt.savefig(os.path.join(OUTPUT_DIR,"confusion_matrix_rf.png"))
+sns.heatmap(cm,annot=True,fmt="d",xticklabels=["Intact","Half","Quarter"],yticklabels=["Intact","Half","Quarter"])
+plt.savefig(os.path.join(OUTPUT,"confusion_standard_RF.png"))
 plt.close()
 
 # ============================================================
-# 6. Normal-tail model (intact only)
+# 11. Fraction-missing model
 # ============================================================
 
-df_intact = df_feat[df_feat["TailDocking"]=="Intact"].dropna(subset=reg_features + ["TailLength_cm_gt"])
+df_intact = df_feat[df_feat["TailDocking"]=="Intact"].dropna(subset=reg_features+["TailLength_cm_gt"])
+Xn = df_intact[reg_features].values
+yn = df_intact["TailLength_cm_gt"].values
 
-Xn = df_intact[reg_features]
-yn = df_intact["TailLength_cm_gt"]
+rf_norm = RandomForestRegressor(n_estimators=300,random_state=42)
+rf_norm.fit(Xn,yn)
 
-rf_normal = RandomForestRegressor(n_estimators=300, random_state=42)
-rf_normal.fit(Xn, yn)
-
-df_feat["PredictedNormalTail_cm"] = rf_normal.predict(df_feat[reg_features].fillna(0))
-df_feat["FracMissing_Pred"] = 1 - df_feat["PredTailLength_cm"] / (df_feat["PredictedNormalTail_cm"] + eps)
-
-# ============================================================
-# 7. Fraction-missing threshold model
-# ============================================================
-
-df_thresh = df_feat.dropna(subset=["FracMissing_Pred","TailDocking"])
-df_thresh = df_thresh[df_thresh["TailDocking"]!="Intact"]
-
-best_acc=0
-best_t=0
-
-for t in np.linspace(0.2,0.8,200):
-    pred = np.where(df_thresh["FracMissing_Pred"]<t,"Half","Quarter")
-    acc = np.mean(pred==df_thresh["TailDocking"])
-    if acc>best_acc:
-        best_acc=acc
-        best_t=t
-
-print("Best threshold:",best_t,"Accuracy:",best_acc)
+df_feat["PredictedNormalTail_cm"] = rf_norm.predict(df_feat[reg_features].fillna(0).values)
+df_feat["FracMissing_GT"] = 1 - df_feat["TailLength_cm_gt"]/df_feat["PredictedNormalTail_cm"]
 
 # ============================================================
-# 8. Herd-level validation
+# 12. Save outputs
 # ============================================================
 
-herd_stats=[]
-for herd,g in df_feat.groupby("HerdId"):
-    if len(g)<10: continue
-    herd_stats.append({
-        "Herd":herd,
-        "R2":r2_score(g["TailLength_cm_gt"],g["PredTailLength_cm"]),
-        "RMSE":np.sqrt(mean_squared_error(g["TailLength_cm_gt"],g["PredTailLength_cm"]))
-    })
+df_feat.to_csv(os.path.join(OUTPUT,"all_features_and_predictions.csv"),index=False)
+joblib.dump(rf_len,os.path.join(OUTPUT,"rf_length.pkl"))
+joblib.dump(rf_clf,os.path.join(OUTPUT,"rf_classifier.pkl"))
+joblib.dump(rf_norm,os.path.join(OUTPUT,"rf_normal.pkl"))
 
-herd_stats=pd.DataFrame(herd_stats)
-print(herd_stats)
+print("Pipeline finished. All outputs written to:", OUTPUT)
 
-herd_stats.to_csv(os.path.join(OUTPUT_DIR,"herd_performance.csv"),index=False)
 
-# ============================================================
-# 9. Save models
-# ============================================================
-
-joblib.dump(rf_len, os.path.join(OUTPUT_DIR,"rf_tail_length.pkl"))
-joblib.dump(rf_clf, os.path.join(OUTPUT_DIR,"rf_docking.pkl"))
-joblib.dump(rf_normal, os.path.join(OUTPUT_DIR,"rf_normal_tail.pkl"))
-
-print("Pipeline completed successfully")
